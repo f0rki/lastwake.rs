@@ -1,0 +1,12 @@
+[package]
+name = "lastwake"
+version = "0.1.0"
+authors = ["Michael Rodler <michael.rodler@paluno.uni-due.de>"]
+edition = "2018"
+
+[dependencies]
+systemd = "0.4"
+#systemd = { git = "https://github.com/jmesmon/rust-systemd" }
+chrono = "0.4"
+hex = "0.3.2"
+clap = "2.33"
