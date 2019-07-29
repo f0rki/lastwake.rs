@@ -434,32 +434,30 @@ fn main() {
                 //        .date();
                 let from_date: Date<chrono::Local> = chrono::Local
                     .from_local_date(
-                        &chrono::NaiveDateTime::parse_from_str(
+                        &chrono::NaiveDate::parse_from_str(
                             matches.value_of("from").unwrap(),
                             "%Y-%m-%d",
                         )
-                        .unwrap()
-                        .date(),
+                        .unwrap(),
                     )
                     .unwrap();
 
                 let to_date = if matches.is_present("to") {
                     if let Ok(off) = matches.value_of("to").unwrap().parse::<i64>() {
-                        from_date - Duration::days(off)
+                        from_date + Duration::days(off)
                     } else {
                         chrono::Local
                             .from_local_date(
-                                &chrono::NaiveDateTime::parse_from_str(
+                                &chrono::NaiveDate::parse_from_str(
                                     matches.value_of("to").unwrap(),
                                     "%Y-%m-%d",
                                 )
-                                .unwrap()
-                                .date(),
+                                .unwrap(),
                             )
                             .unwrap()
                     }
                 } else {
-                    from_date.clone()
+                    from_date.clone() + Duration::days(1)
                 };
 
                 let mut days = Vec::new();
@@ -468,7 +466,7 @@ fn main() {
                     days.push(day);
                     day = day + Duration::days(1);
                 }
-                days.push(to_date);
+                days.reverse();
                 days
             }
         } else {
