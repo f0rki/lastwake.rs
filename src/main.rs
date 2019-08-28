@@ -3,7 +3,7 @@ extern crate clap;
 extern crate hex;
 extern crate systemd;
 
-use chrono::{Date, DateTime, Duration, TimeZone, Timelike};
+use chrono::{Date, DateTime, Duration, TimeZone};
 use std::string::String;
 use std::time::SystemTime;
 use std::vec::Vec;
@@ -14,8 +14,6 @@ use systemd::journal;
 
 static BOOTID: &'static str = "_BOOT_ID";
 static MESSAGE: &'static str = "MESSAGE";
-
-static MSGPREFIX: &'static str = "MESSAGE";
 
 static SUSPENDSTART: &'static str = "Reached target Sleep.";
 static HIBERNATESTART: &'static str = "Suspending system...";
@@ -33,6 +31,7 @@ static MSGS: [&str; 5] = [
 
 #[derive(Debug, Eq, PartialEq)]
 enum EventType {
+    Unknown,
     Boot,
     WakeUp,
     Sleep,
@@ -67,6 +66,10 @@ fn ts_to_date(ts: SystemTime) -> DateTime<chrono::Local> {
     chrono::Local.timestamp(dur.as_secs() as i64, dur.subsec_nanos())
 }
 
+fn open_journal() -> journal::Journal {
+    journal::Journal::open(journal::JournalFiles::System, false, true).unwrap()
+}
+
 fn get_boot_id(j: &mut journal::Journal) -> String {
     j.previous_record().unwrap();
     j.next_record()
@@ -98,6 +101,45 @@ fn discover_previous_boot(j: &mut journal::Journal) -> Option<journal::JournalRe
     j.seek(journal::JournalSeek::Head).unwrap();
     j.match_flush().unwrap();
     j.previous_record().unwrap()
+}
+
+fn get_first_record_of(
+    j: &mut journal::Journal,
+    bootid: Option<String>,
+) -> Option<journal::JournalRecord> {
+    let _bootid: String = if let Some(x) = bootid {
+        x
+    } else {
+        get_boot_id(j)
+    };
+    j.match_flush().unwrap();
+    j.match_add(BOOTID, _bootid).unwrap();
+    j.seek(journal::JournalSeek::Head).unwrap();
+    j.match_flush().unwrap();
+    j.previous_record().unwrap();
+    j.next_record().unwrap()
+}
+
+fn format_boot_record(j: &mut journal::Journal, x: journal::JournalRecord) -> Event {
+    let timestamp = j.timestamp().unwrap();
+    let boot_id = x.get(BOOTID).unwrap().clone();
+    Event {
+        kind: EventType::Boot,
+        timestamp: timestamp,
+        datetime: ts_to_date(timestamp),
+        duration: Duration::zero(),
+        message: "Boot [[".to_string() + x.get(MESSAGE).unwrap() + "]]",
+        boot_id: boot_id,
+    }
+}
+
+fn get_boot_event(j: &mut journal::Journal, bootid: Option<String>) -> Option<Event> {
+    // we want to avoid actually changing j, so we open a new journal and seek to the current cursor
+    if let Some(x) = get_first_record_of(j, bootid) {
+        Some(format_boot_record(j, x))
+    } else {
+        None
+    }
 }
 
 fn print_boots(boots: Vec<BootEvents>) {
@@ -151,8 +193,7 @@ fn print_boots(boots: Vec<BootEvents>) {
 }
 
 fn print_events(events: EventList) {
-    //let current_boot = get_current_boot_id();
-
+    let mut total_waketime = chrono::Duration::seconds(0);
     println!("|    Wake at       |      Sleep at    | Awake For | Type  |");
     println!("| ---------------- | ---------------- | --------- | ----- |");
     //intln!("| 2019-01-01 01:01 | 2019-01-01 01:01 |     00:00 |");
@@ -161,7 +202,8 @@ fn print_events(events: EventList) {
         match start_event.kind {
             EventType::Boot | EventType::WakeUp => {
                 if let Some(next_event) = i.next() {
-                    if next_event.duration.num_seconds() != 0 {
+                    // we ignore events with less than a second duration
+                    if next_event.duration.num_seconds() > 0 {
                         println!(
                             "| {} | {} |     {:02}:{:02} | {} => {} |",
                             start_event.datetime.format("%Y-%m-%d %H:%M"),
@@ -173,6 +215,8 @@ fn print_events(events: EventList) {
                             format!("{:?}", start_event.kind),
                             format!("{:?}", next_event.kind),
                         );
+
+                        total_waketime = total_waketime + next_event.duration;
                     }
                 } else {
                     //if start_event.boot_id == current_boot {
@@ -193,6 +237,11 @@ fn print_events(events: EventList) {
             _ => {}
         }
     }
+    println!(
+        "Total Time Awake: {:02}:{:02}",
+        total_waketime.num_hours(),
+        (total_waketime - Duration::hours(total_waketime.num_hours())).num_minutes(),
+    );
 }
 
 fn print_events_boots(boots: Vec<BootEvents>) {
@@ -218,12 +267,35 @@ fn print_events_boots(boots: Vec<BootEvents>) {
 fn collect_events(
     j: &mut journal::Journal,
     events: &mut Vec<Event>,
+    only_boot_id: Option<String>,
+    min_timestamp: Option<DateTime<chrono::Local>>,
     max_timestamp: Option<DateTime<chrono::Local>>,
 ) {
+    let mut current_bootid = "".to_string();
+    j.match_flush().unwrap();
+    if let Some(_bootid) = only_boot_id.clone() {
+        // we seek to the start of the boot
+        j.match_add(BOOTID, _bootid.clone()).unwrap();
+        j.seek(journal::JournalSeek::Head).unwrap();
+
+        // now if we're there anyway, we get the first message of the boot and add it to our events
+        // list
+        let r = j.next_record().unwrap().unwrap();
+        let x = format_boot_record(j, r);
+        events.push(x);
+
+        j.match_flush().unwrap();
+        j.match_add(BOOTID, _bootid.clone()).unwrap();
+        j.match_and().unwrap();
+
+        current_bootid = _bootid.clone();
+    }
     // adding filters for the relevant messages:
     for msg in MSGS.iter() {
-        j.match_add(MSGPREFIX, *msg).unwrap();
-        j.match_or().unwrap();
+        j.match_add(MESSAGE, *msg).unwrap();
+        if msg != MSGS.last().unwrap() {
+            j.match_or().unwrap();
+        }
     }
 
     // Iterate over systemd log
@@ -232,7 +304,7 @@ fn collect_events(
         let message = x.get(MESSAGE).unwrap();
         let timestamp = j.timestamp().unwrap();
 
-        let mut _type = EventType::Boot;
+        let mut _type = EventType::Unknown;
         if message.contains(SUSPENDSTART) || message.contains(HIBERNATESTART) {
             _type = EventType::Sleep;
         } else if message.contains(SHUTTINGDOWN) {
@@ -252,6 +324,69 @@ fn collect_events(
             }
         }
 
+        if _type == EventType::Unknown {
+            panic!("There should never be a unknown event type!");
+        }
+
+        // Here we check if the boot_id changed and inject the boot event.
+        // Problem is: there is no clear log line that would allow us to identify the boot.
+        // So we basically have to find the first log entry that does have a different boot id to
+        // identify boot mesages.
+        //
+        // Of course this doesn't work if we use the journal match API, because there we need to
+        // supply fixed strings...
+        //
+        // WARNING: this block seems to invalidate some objects returned by systemd...
+        // --> solution was to move this whole block after all the information about the current
+        // record (in the variable x) is extracted
+        if boot_id != current_bootid {
+            // backup the current journal cursor
+            let c = j.cursor().unwrap().clone();
+
+            // now we get the boot event and put it between events
+            // WARNING: get_boot_event uses the match API of journald and therefore breaks the
+            // iteration order in the main loop of this function
+            if let Some(_min_ts) = min_timestamp {
+                if let Some(mut bootevent) = get_boot_event(j, Some(boot_id.clone())) {
+                    if bootevent.datetime > _min_ts {
+                        if let Some(last) = events.last() {
+                            bootevent.duration = Duration::from_std(
+                                bootevent.timestamp.duration_since(last.timestamp).unwrap(),
+                            )
+                            .unwrap()
+                        }
+
+                        events.push(bootevent);
+                    }
+                }
+            }
+
+            // we flush the matches and seek to the backed up cursor, such that we can take of where
+            // we left.
+            j.match_flush().unwrap();
+            j.seek(journal::JournalSeek::Cursor { cursor: c.clone() })
+                .unwrap();
+
+            // we need to re-add the matches here
+            j.match_flush().unwrap();
+            if let Some(_bootid) = only_boot_id.clone() {
+                j.match_add(BOOTID, _bootid.clone()).unwrap();
+                j.match_and().unwrap();
+            }
+            // adding filters for the relevant messages:
+            for msg in MSGS.iter() {
+                j.match_add(MESSAGE, *msg).unwrap();
+                if msg != MSGS.last().unwrap() {
+                    j.match_or().unwrap();
+                }
+            }
+
+            // finally we change the current_bootid to detect the next boot_id change
+            current_bootid = boot_id.clone();
+        }
+
+        // and now we push the actual event that we found
+        // WARNING: do not use any method on the record x or journal j here!
         events.push(if let Some(last) = events.last() {
             Event {
                 kind: _type,
@@ -279,31 +414,7 @@ fn collect_events(
 fn get_events_for_boot(j: &mut journal::Journal, bootid: String) -> Vec<Event> {
     // we'll store all events here and return it
     let mut events = Vec::<Event>::new();
-    // seek to first record in the journal
-    j.match_flush().unwrap();
-    j.match_add(BOOTID, bootid).unwrap();
-    j.match_and().unwrap();
-    j.seek(journal::JournalSeek::Head).unwrap();
-    j.previous_record().unwrap();
-    // assume this is the time of the boot
-    if let Some(x) = j.next_record().unwrap() {
-        let timestamp = j.timestamp().unwrap();
-        let boot_id = x.get(BOOTID).unwrap().clone();
-        events.push(Event {
-            kind: EventType::Boot,
-            timestamp: timestamp,
-            datetime: ts_to_date(timestamp),
-            duration: Duration::zero(),
-            message: "Boot [[".to_string() + x.get(MESSAGE).unwrap() + "]]",
-            boot_id: boot_id,
-        });
-    } else {
-        println!("warning: nonono");
-        return events;
-    }
-
-    collect_events(j, &mut events, None);
-
+    collect_events(j, &mut events, Some(bootid), None, None);
     return events;
 }
 
@@ -314,14 +425,15 @@ fn get_events_for_day(j: &mut journal::Journal, day: Date<chrono::Local>) -> Vec
 
     // seek to 00:00 of the day
     let day_start = day.and_hms(0, 0, 0);
-    let ts = day_start.timestamp_nanos() / 1000;
+    let ts = day_start.naive_local().timestamp_nanos() / 1000;
+    j.match_flush().unwrap();
     j.seek(journal::JournalSeek::ClockRealtime { usec: ts as u64 })
         .unwrap();
 
     // collect all events until 23:59 of the day
     let end_day = day_start + chrono::Duration::days(1);
 
-    collect_events(j, &mut events, Some(end_day));
+    collect_events(j, &mut events, None, Some(day_start), Some(end_day));
 
     events
 }
@@ -409,7 +521,7 @@ fn main() {
         return;
     }
 
-    let mut j = journal::Journal::open(journal::JournalFiles::System, false, true).unwrap();
+    let mut j = open_journal();
 
     let mut boots: Vec<BootEvents> = Vec::new();
 
@@ -521,3 +633,18 @@ fn main() {
         }
     }
 }
+
+//if boot_id != current_bootid {
+//    if let Some(mut x) = get_boot_event(j, Some(boot_id.clone())) {
+//        println!("got boot even {:?}", x);
+//        if let Some(last) = events.last() {
+//            x.duration =
+//                Duration::from_std(x.timestamp.duration_since(last.timestamp).unwrap())
+//                    .unwrap();
+//        }
+//        events.push(x);
+//    } else {
+//        println!("WARNING: no boot event found for boot {}!", boot_id);
+//    }
+//    current_bootid = boot_id.clone();
+//}
