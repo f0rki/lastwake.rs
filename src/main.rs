@@ -9,18 +9,27 @@ use std::time::SystemTime;
 use std::vec::Vec;
 use systemd::journal;
 
-// Kernel messages lingo: Hibernation = to disk; Suspend = to RAM;
-// Sleep = either hibernation (S4) or suspend (S3)
-
 static BOOTID: &'static str = "_BOOT_ID";
 static MESSAGE: &'static str = "MESSAGE";
 
-static SUSPENDSTART: &'static str = "Reached target Sleep.";
-static HIBERNATESTART: &'static str = "Suspending system...";
+// Generally: Hibernation = to disk; Suspend = to RAM;
+//
+// TODO: systemd now supports more sleep/hibernation modes (see man systemd.special)
+// * hybrid-sleep.target
+// * suspend-then-hibernate.target
+//
+// All those targets pull in the "sleep.target", which we can search for in the journal to get all
+// the sleepy targets... However, then we don't know what kind of sleep it was? (except when
+// searching for the specific wakup message)
+//
+// Currently we're taking the start timestamp from the messages that show up when the special
+// systemd targets/services are activated.
+static SUSPENDSTART: &'static str = "Starting Suspend...";
+static HIBERNATESTART: &'static str = "Starting Hibernate...";
 static SUSPENDWAKE: &'static str = "ACPI: Waking up from system sleep state S3";
 static HIBERNATEWAKE: &'static str = "ACPI: Waking up from system sleep state S4";
 static SHUTTINGDOWN: &'static str = "Shutting down.";
-// this one doesn't seem to work...
+
 static MSGS: [&str; 5] = [
     SUSPENDSTART,
     HIBERNATESTART,
@@ -38,10 +47,23 @@ enum EventType {
     Shutdown,
 }
 
+// TODO: parse the type of sleep from the log and properly store it as enum in the Event struct
+/*
+enum SleepType {
+    Suspend, // S3
+    Hibernate, // S4
+    // TODO: not sure what kind of ACPI wakeup message we will see with those targets?
+    HybridSleep,
+    SuspendThenHibernate,
+}
+*/
+
 #[derive(Debug)]
 struct Event {
     kind: EventType,
     timestamp: std::time::SystemTime,
+    timestamp_mono: u64,
+    // TODO: remove duration from Event and calculate on-the-fly!
     duration: chrono::Duration,
     datetime: chrono::DateTime<chrono::Local>,
     message: String,
@@ -122,10 +144,12 @@ fn get_first_record_of(
 
 fn format_boot_record(j: &mut journal::Journal, x: journal::JournalRecord) -> Event {
     let timestamp = j.timestamp().unwrap();
+    let (ts_mono, _) = j.monotonic_timestamp().unwrap();
     let boot_id = x.get(BOOTID).unwrap().clone();
     Event {
         kind: EventType::Boot,
         timestamp: timestamp,
+        timestamp_mono: ts_mono,
         datetime: ts_to_date(timestamp),
         duration: Duration::zero(),
         message: "Boot [[".to_string() + x.get(MESSAGE).unwrap() + "]]",
@@ -181,7 +205,6 @@ fn print_boots(boots: Vec<BootEvents>) {
                                         .num_minutes(),
                                 );
                             } else {
-
                             }
                         }
                     }
@@ -248,13 +271,18 @@ fn print_events_boots(boots: Vec<BootEvents>) {
     for b in boots.iter() {
         if let Some(f) = b.events.first() {
             println!("\nboot {} on {}", b.boot_id, f.datetime);
-            println!("|  Event   |             Date           | Duration | Message |");
-            println!("| -------- | -------------------------- | -------- | ------- |");
+            println!(
+                "|  Event   |                 Date              | Monotonic TS | Duration | Message |"
+            );
+            println!(
+                "| -------- | --------------------------------- | ------------ | -------- | ------- |"
+            );
             for event in b.events.iter() {
                 println!(
-                    "| {:8} | {} |  {:02}:{:02}   | {} |",
+                    "| {:8} | {} | {}  |  {:02}:{:02}   | {} |",
                     format!("{:?}", event.kind),
                     event.datetime,
+                    event.timestamp_mono,
                     event.duration.num_hours(),
                     (event.duration - Duration::hours(event.duration.num_hours())).num_minutes(),
                     event.message
@@ -271,7 +299,7 @@ fn collect_events(
     min_timestamp: Option<DateTime<chrono::Local>>,
     max_timestamp: Option<DateTime<chrono::Local>>,
 ) {
-    let mut current_bootid = "".to_string();
+    let mut current_bootid: String;
     j.match_flush().unwrap();
     if let Some(_bootid) = only_boot_id.clone() {
         // we seek to the start of the boot
@@ -289,6 +317,27 @@ fn collect_events(
         j.match_and().unwrap();
 
         current_bootid = _bootid.clone();
+    } else {
+        let x = j.next_record().unwrap().unwrap();
+        let bid = x.get(BOOTID).unwrap().clone();
+        j.previous_record().unwrap();
+        let c = j.cursor().unwrap().clone();
+        if let Some(_min_ts) = min_timestamp {
+            if let Some(bootevent) = get_boot_event(j, Some(bid.clone())) {
+                if bootevent.datetime > _min_ts {
+                    events.push(bootevent);
+                }
+            }
+        } else {
+            if let Some(bootevent) = get_boot_event(j, Some(bid.clone())) {
+                events.push(bootevent);
+            }
+        }
+
+        j.seek(journal::JournalSeek::Cursor { cursor: c.clone() })
+            .unwrap();
+
+        current_bootid = bid;
     }
     // adding filters for the relevant messages:
     for msg in MSGS.iter() {
@@ -301,8 +350,9 @@ fn collect_events(
     // Iterate over systemd log
     while let Some(x) = j.next_record().unwrap() {
         let boot_id = x.get(BOOTID).unwrap().clone();
-        let message = x.get(MESSAGE).unwrap();
+        let message = x.get(MESSAGE).unwrap().clone();
         let timestamp = j.timestamp().unwrap();
+        let (ts_mono, _) = j.monotonic_timestamp().unwrap();
 
         let mut _type = EventType::Unknown;
         if message.contains(SUSPENDSTART) || message.contains(HIBERNATESTART) {
@@ -311,6 +361,8 @@ fn collect_events(
             _type = EventType::Shutdown;
         } else if message.contains(SUSPENDWAKE) || message.contains(HIBERNATEWAKE) {
             _type = EventType::WakeUp;
+        } else {
+            panic!("There should never be a unknown event type!");
         }
 
         if let Some(maxts) = max_timestamp {
@@ -322,10 +374,6 @@ fn collect_events(
                     return;
                 }
             }
-        }
-
-        if _type == EventType::Unknown {
-            panic!("There should never be a unknown event type!");
         }
 
         // Here we check if the boot_id changed and inject the boot event.
@@ -359,6 +407,18 @@ fn collect_events(
                         events.push(bootevent);
                     }
                 }
+            } else {
+                // copy-paste from the block above
+                if let Some(mut bootevent) = get_boot_event(j, Some(boot_id.clone())) {
+                    if let Some(last) = events.last() {
+                        bootevent.duration = Duration::from_std(
+                            bootevent.timestamp.duration_since(last.timestamp).unwrap(),
+                        )
+                        .unwrap()
+                    }
+
+                    events.push(bootevent);
+                }
             }
 
             // we flush the matches and seek to the backed up cursor, such that we can take of where
@@ -391,6 +451,7 @@ fn collect_events(
             Event {
                 kind: _type,
                 timestamp: timestamp,
+                timestamp_mono: ts_mono,
                 datetime: ts_to_date(timestamp),
                 duration: Duration::from_std(timestamp.duration_since(last.timestamp).unwrap())
                     .unwrap(),
@@ -402,12 +463,14 @@ fn collect_events(
             Event {
                 kind: _type,
                 timestamp: timestamp,
+                timestamp_mono: ts_mono,
                 datetime: ts_to_date(timestamp),
                 duration: Duration::zero(),
                 message: message.to_string(),
                 boot_id: boot_id,
             }
-        })
+        });
+        //println!("{:?}", events.last().unwrap());
     }
 }
 
@@ -497,6 +560,7 @@ fn collect_bootids_from_boot(
 fn main() {
     let matches = clap::App::new("lastwake.rs")
         .version("0.1")
+        .setting(clap::AppSettings::AllowNegativeNumbers)
         .about("systemd journal boot/suspend event analyzer")
         .arg(
             clap::Arg::with_name("daily")
@@ -578,6 +642,7 @@ fn main() {
                     days.push(day);
                     day = day + Duration::days(1);
                 }
+                days.push(to_date.clone());
                 days.reverse();
                 days
             }
@@ -633,18 +698,3 @@ fn main() {
         }
     }
 }
-
-//if boot_id != current_bootid {
-//    if let Some(mut x) = get_boot_event(j, Some(boot_id.clone())) {
-//        println!("got boot even {:?}", x);
-//        if let Some(last) = events.last() {
-//            x.duration =
-//                Duration::from_std(x.timestamp.duration_since(last.timestamp).unwrap())
-//                    .unwrap();
-//        }
-//        events.push(x);
-//    } else {
-//        println!("WARNING: no boot event found for boot {}!", boot_id);
-//    }
-//    current_bootid = boot_id.clone();
-//}
