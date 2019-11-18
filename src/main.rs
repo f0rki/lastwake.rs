@@ -1,4 +1,6 @@
 extern crate chrono;
+// TODO: switch to clap macros?
+#[macro_use]
 extern crate clap;
 extern crate hex;
 extern crate systemd;
@@ -368,8 +370,11 @@ fn collect_events(
         if let Some(maxts) = max_timestamp {
             if ts_to_date(timestamp) > maxts {
                 if _type == EventType::Sleep || _type == EventType::Shutdown {
-                    // We just add this to the list even though it's past the max_timestamp s.t., we
-                    // have the complete wake/sleep pair
+                    // TODO: handle the edge case, where the wakeup event was on the day X (X <
+                    // maxts), but the sleepevent und the following day.
+                    //
+
+                    return;
                 } else {
                     return;
                 }
@@ -507,7 +512,6 @@ fn collect_bootids(j: &mut journal::Journal, from: usize, to: usize) -> Vec<Stri
     // seek to end first
     j.match_flush().unwrap();
     j.seek(journal::JournalSeek::Tail).unwrap();
-    j.previous_record().unwrap();
 
     let mut msg = j.next_record().unwrap().unwrap();
     let mut i = 0;
@@ -557,8 +561,18 @@ fn collect_bootids_from_boot(
     bootids
 }
 
+fn parse_ymd(s: &str) -> chrono::NaiveDate {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|e| {
+        clap::Error::with_description(
+            &format!("Invalid date format; expecting '%Y-%m-%d' ({})", e),
+            clap::ErrorKind::ValueValidation,
+        )
+        .exit()
+    })
+}
+
 fn main() {
-    let matches = clap::App::new("lastwake.rs")
+    let app = clap::App::new("lastwake.rs")
         .version("0.1")
         .setting(clap::AppSettings::AllowNegativeNumbers)
         .about("systemd journal boot/suspend event analyzer")
@@ -577,8 +591,8 @@ fn main() {
                 .conflicts_with("daily"),
         )
         .arg(clap::Arg::with_name("from"))
-        .arg(clap::Arg::with_name("to"))
-        .get_matches();
+        .arg(clap::Arg::with_name("to"));
+    let matches = app.get_matches();
 
     if !have_journal() {
         println!("systemd-journald doesn't seem to available!");
@@ -588,13 +602,14 @@ fn main() {
     let mut j = open_journal();
 
     let mut boots: Vec<BootEvents> = Vec::new();
+    let today = chrono::Local::today();
+    let now = chrono::Local::now();
 
     if matches.is_present("daily") {
-        let today = chrono::Local::today();
         let mut days = if matches.is_present("from") {
-            if let Ok(start) = matches.value_of("from").unwrap().parse::<i64>() {
+            if let Ok(start) = value_t!(matches, "from", i64) {
                 let end = if matches.is_present("to") {
-                    matches.value_of("to").unwrap().parse::<i64>().unwrap()
+                    value_t_or_exit!(matches, "to", i64)
                 } else {
                     start
                 };
@@ -609,27 +624,15 @@ fn main() {
                 //        .unwrap()
                 //        .date();
                 let from_date: Date<chrono::Local> = chrono::Local
-                    .from_local_date(
-                        &chrono::NaiveDate::parse_from_str(
-                            matches.value_of("from").unwrap(),
-                            "%Y-%m-%d",
-                        )
-                        .unwrap(),
-                    )
+                    .from_local_date(&parse_ymd(matches.value_of("from").unwrap()))
                     .unwrap();
 
                 let to_date = if matches.is_present("to") {
-                    if let Ok(off) = matches.value_of("to").unwrap().parse::<i64>() {
+                    if let Ok(off) = value_t!(matches, "to", i64) {
                         from_date + Duration::days(off)
                     } else {
                         chrono::Local
-                            .from_local_date(
-                                &chrono::NaiveDate::parse_from_str(
-                                    matches.value_of("to").unwrap(),
-                                    "%Y-%m-%d",
-                                )
-                                .unwrap(),
-                            )
+                            .from_local_date(&parse_ymd(matches.value_of("to").unwrap()))
                             .unwrap()
                     }
                 } else {
@@ -642,7 +645,7 @@ fn main() {
                     days.push(day);
                     day = day + Duration::days(1);
                 }
-                days.push(to_date.clone());
+                //days.push(to_date.clone());
                 days.reverse();
                 days
             }
@@ -653,16 +656,25 @@ fn main() {
         days.reverse();
 
         for day in days {
+            if day > today {
+                clap::Error::with_description(
+                    "Invalid date format: date must not be in the future!",
+                    clap::ErrorKind::ValueValidation,
+                )
+                .exit()
+            }
+            // TODO: hmm this is wrong, when there was a day with no sleep/wake cycle.
+            println!("\nDay {}", day);
             let events = get_events_for_day(&mut j, day);
             //println!("\nDay {}, {}", day.weekday(), day);
-            println!("\nDay {}", day);
             print_events(events);
         }
     } else {
         let bootids = if matches.is_present("from") {
             if let Ok(start) = matches.value_of("from").unwrap().parse::<isize>() {
                 let end = if matches.is_present("to") {
-                    matches.value_of("to").unwrap().parse::<isize>().unwrap()
+                    //matches.value_of("to").unwrap().parse::<isize>().unwrap()
+                    value_t_or_exit!(matches, "to", isize)
                 } else {
                     start
                 };
@@ -671,11 +683,13 @@ fn main() {
                 collect_bootids_from_boot(
                     &mut j,
                     matches.value_of("from").unwrap().to_string(),
-                    matches
-                        .value_of("to")
-                        .unwrap_or("0")
-                        .parse::<isize>()
-                        .unwrap(),
+                    //matches
+                    //    .value_of("to")
+                    //    .unwrap_or("0")
+                    //    .parse::<isize>()
+                    //    .unwrap()
+                    //    .abs(),
+                    value_t!(matches, "to", isize).unwrap_or(0).abs(),
                 )
             }
         } else {
