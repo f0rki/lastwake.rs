@@ -512,6 +512,7 @@ fn collect_bootids(j: &mut journal::Journal, from: usize, to: usize) -> Vec<Stri
     // seek to end first
     j.match_flush().unwrap();
     j.seek(journal::JournalSeek::Tail).unwrap();
+    j.previous_record().unwrap();
 
     let mut msg = j.next_record().unwrap().unwrap();
     let mut i = 0;
