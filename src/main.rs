@@ -254,6 +254,7 @@ fn print_events(events: EventList) {
                         duration.num_hours(),
                         (duration - Duration::hours(duration.num_hours())).num_minutes(),
                     );
+                    total_waketime = total_waketime + duration;
                     //} else {
 
                     //}
@@ -604,7 +605,7 @@ fn main() {
 
     let mut boots: Vec<BootEvents> = Vec::new();
     let today = chrono::Local::today();
-    let now = chrono::Local::now();
+    //let now = chrono::Local::now();
 
     if matches.is_present("daily") {
         let mut days = if matches.is_present("from") {
