@@ -633,9 +633,14 @@ fn main() {
                     if let Ok(off) = value_t!(matches, "to", i64) {
                         from_date + Duration::days(off)
                     } else {
-                        chrono::Local
-                            .from_local_date(&parse_ymd(matches.value_of("to").unwrap()))
-                            .unwrap()
+                        let to_val_str = matches.value_of("to").unwrap();
+                        if to_val_str == "today" || to_val_str == "-" || to_val_str == "now" {
+                            chrono::Local::today()
+                        } else {
+                            chrono::Local
+                                .from_local_date(&parse_ymd(to_val_str))
+                                .unwrap()
+                        }
                     }
                 } else {
                     from_date.clone() + Duration::days(1)
